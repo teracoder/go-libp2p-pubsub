@@ -1161,7 +1161,21 @@ func (p *PubSub) handleDeadPeers() {
 		q.Close()
 		delete(p.peers, pid)
 
-		p.clearPeerFromTopicsState(pid)
+		// The peer's topic state is learned from its inbound stream, and
+		// onClosedIncomingStream clears it when that stream closes. Our outbound
+		// stream dying says nothing about it: with duplicate connections (e.g. a
+		// peer with a fixed identity restarted while its old process was still
+		// up) the outbound stream can die on the old connection after the peer
+		// has already re-announced its subscriptions on a new inbound stream.
+		// Clearing here would drop those subscriptions while the peer stays
+		// connected, and the peer never re-sends them.
+		p.inboundStreamsMx.Lock()
+		_, hasInbound := p.inboundStreams[pid]
+		p.inboundStreamsMx.Unlock()
+
+		if !hasInbound {
+			p.clearPeerFromTopicsState(pid)
+		}
 		p.rt.OnClosedOutboundStream(pid)
 
 		if p.host.Network().Connectedness(pid) == network.Connected {
