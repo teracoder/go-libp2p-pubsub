@@ -138,7 +138,7 @@ type PubSub struct {
 	peerDead       chan struct{}
 	peerDeadPrioLk sync.RWMutex
 	peerDeadMx     sync.Mutex
-	peerDeadPend   map[peer.ID]struct{}
+	peerDeadPend   map[peer.ID]network.Conn // connection the dead outbound stream was on
 	// backoff for retrying new connections to dead peers
 	deadPeerBackoff *backoff
 
@@ -639,7 +639,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		newPeerStream:         make(chan peerOutgoingStream),
 		newPeerError:          make(chan peer.ID),
 		peerDead:              make(chan struct{}, 1),
-		peerDeadPend:          make(map[peer.ID]struct{}),
+		peerDeadPend:          make(map[peer.ID]network.Conn),
 		deadPeerBackoff:       newBackoff(ctx, 1000, BackoffCleanupInterval, MaxBackoffAttempts),
 		cancelCh:              make(chan *Subscription),
 		getPeers:              make(chan *listPeerReq),
@@ -1149,10 +1149,10 @@ func (p *PubSub) handleDeadPeers() {
 	}
 
 	deadPeers := p.peerDeadPend
-	p.peerDeadPend = make(map[peer.ID]struct{})
+	p.peerDeadPend = make(map[peer.ID]network.Conn)
 	p.peerDeadPrioLk.Unlock()
 
-	for pid := range deadPeers {
+	for pid, deadConn := range deadPeers {
 		q, ok := p.peers[pid]
 		if !ok {
 			continue
@@ -1179,7 +1179,18 @@ func (p *PubSub) handleDeadPeers() {
 		p.rt.OnClosedOutboundStream(pid)
 
 		if p.host.Network().Connectedness(pid) == network.Connected {
-			backoffDelay, err := p.deadPeerBackoff.updateAndGet(pid)
+			// The backoff guards against a peer that keeps resetting our stream
+			// on a live connection, and allows only MaxBackoffAttempts respawns
+			// per TimeToLive before the peer is dropped for good. A stream that
+			// died with its connection while another connection remains is not
+			// that: a duplicate connection went away (e.g. the old process of a
+			// peer restarted with a fixed identity). Respawn at once without
+			// charging the backoff.
+			var backoffDelay time.Duration
+			var err error
+			if deadConn == nil || !deadConn.IsClosed() {
+				backoffDelay, err = p.deadPeerBackoff.updateAndGet(pid)
+			}
 			if err != nil {
 				p.logger.Debug("error updating backoff", "err", err, "peer", pid)
 				continue

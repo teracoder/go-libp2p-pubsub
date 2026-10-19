@@ -158,10 +158,10 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 	}
 }
 
-func (p *PubSub) notifyPeerDead(pid peer.ID) {
+func (p *PubSub) notifyPeerDead(pid peer.ID, conn network.Conn) {
 	p.peerDeadPrioLk.RLock()
 	p.peerDeadMx.Lock()
-	p.peerDeadPend[pid] = struct{}{}
+	p.peerDeadPend[pid] = conn
 	p.peerDeadMx.Unlock()
 	p.peerDeadPrioLk.RUnlock()
 
@@ -213,7 +213,7 @@ func (p *PubSub) handlePeerDead(s network.Stream) {
 	}
 
 	s.Reset()
-	p.notifyPeerDead(pid)
+	p.notifyPeerDead(pid, s.Conn())
 }
 
 func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing *rpcQueue, firstMessage chan *RPC) {

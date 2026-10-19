@@ -2,6 +2,7 @@ package pubsub
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -141,5 +142,122 @@ func TestTopicStateSurvivesSameIDReconnect(t *testing.T) {
 	}
 	if string(msg.Data) != "after-restart" {
 		t.Fatalf("unexpected message %q", msg.Data)
+	}
+}
+
+// TestTopicStateSurvivesRepeatedSameIDRestarts restarts a fixed-identity peer
+// more often than the dead-peer backoff allows writer respawns within its time
+// to live. Each restart's old connection closes and kills our outbound stream
+// on it while the new connection stays up. That is a duplicate connection going
+// away, not the peer resetting our stream, so it must not use up the backoff:
+// otherwise, after MaxBackoffAttempts restarts, the peer is dropped from
+// p.peers, we stop writing to it, and it disappears from every topic while
+// still connected.
+func TestTopicStateSurvivesRepeatedSameIDRestarts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const topicName = "same-id-restarts"
+	const restarts = MaxBackoffAttempts + 3
+
+	skB, _, err := crypto.GenerateEd25519Key(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bID, err := peer.IDFromPrivateKey(skB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hA := newLoopbackHost(t)
+	psA := getGossipsub(ctx, hA)
+
+	topicA, err := psA.Join(topicName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := topicA.Subscribe(); err != nil {
+		t.Fatal(err)
+	}
+
+	startB := func() (host.Host, *Subscription) {
+		h := newLoopbackHost(t, libp2p.Identity(skB))
+		ps := getGossipsub(ctx, h)
+
+		topic, err := ps.Join(topicName)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sub, err := topic.Subscribe()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := h.Connect(ctx, peer.AddrInfo{ID: hA.ID(), Addrs: hA.Addrs()}); err != nil {
+			t.Fatal(err)
+		}
+
+		return h, sub
+	}
+
+	inTopic := func() bool { return slices.Contains(psA.ListPeers(topicName), bID) }
+
+	// delivered publishes payload from A and reports whether sub receives it.
+	delivered := func(sub *Subscription, payload string) bool {
+		if err := topicA.Publish(ctx, []byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+
+		recvCtx, recvCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer recvCancel()
+
+		for {
+			msg, err := sub.Next(recvCtx)
+			if err != nil {
+				return false
+			}
+			if string(msg.Data) == payload {
+				return true
+			}
+		}
+	}
+
+	hB, _ := startB()
+	if !waitUntil(t, 5*time.Second, inTopic) {
+		t.Fatal("first process never joined the topic")
+	}
+
+	// Let A's outbound stream settle on the first process's connection.
+	time.Sleep(time.Second)
+
+	for i := 1; i <= restarts; i++ {
+		next, nextSub := startB()
+		if !waitUntil(t, 5*time.Second, func() bool { return len(hA.Network().ConnsToPeer(bID)) > 1 }) {
+			t.Fatalf("restart %d: new process never connected alongside the old one", i)
+		}
+
+		// Give A time to process the new process's subscriptions.
+		time.Sleep(time.Second)
+
+		hB.Close()
+
+		if !waitUntil(t, 10*time.Second, func() bool { return len(hA.Network().ConnsToPeer(bID)) == 1 }) {
+			t.Fatalf("restart %d: old connection never went away", i)
+		}
+
+		// Allow the dead-peer path and the respawned writer to run.
+		time.Sleep(2 * time.Second)
+
+		if !inTopic() {
+			t.Fatalf("restart %d: peer is still connected but missing from topic %q", i, topicName)
+		}
+
+		if payload := fmt.Sprintf("restart-%d", i); !delivered(nextSub, payload) {
+			t.Fatalf("restart %d: message never reached the new process", i)
+		}
+
+		hB = next
 	}
 }
